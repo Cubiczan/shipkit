@@ -91,8 +91,19 @@ enum SubscriptionStatus {
   TRIAL
   ACTIVE
   PAST_DUE
+  PAUSED
   CANCELED
   EXPIRED
+}
+
+// ─── Stripe Webhook Idempotency ───────────────────────────────────────
+// Records every Stripe event.id we have processed so retried/duplicate
+// webhook deliveries are skipped instead of double-applied.
+
+model ProcessedWebhookEvent {
+  id          String   @id // Stripe event.id (evt_...)
+  type        String
+  processedAt DateTime @default(now())
 }
 
 enum Plan {

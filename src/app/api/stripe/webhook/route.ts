@@ -21,6 +21,30 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid signature" }, { status: 400 })
   }
 
+  // ─── Idempotency guard ──────────────────────────────────────────────
+  // Stripe retries deliveries on any non-2xx response (and may deliver the
+  // same event more than once). Record event.id before handling and skip if
+  // we've already seen it, so handlers never run twice for one event.
+  try {
+    await prisma.processedWebhookEvent.create({
+      data: { id: event.id, type: event.type },
+    })
+  } catch (err) {
+    // Unique-constraint violation (P2002) => already processed: ack and stop.
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      "code" in err &&
+      (err as { code?: string }).code === "P2002"
+    ) {
+      return NextResponse.json({ received: true, duplicate: true })
+    }
+    // Any other error reaching the idempotency store is a real failure —
+    // let Stripe retry rather than silently dropping the event.
+    console.error("Webhook idempotency store error:", err)
+    return NextResponse.json({ error: "Idempotency store unavailable" }, { status: 500 })
+  }
+
   try {
     switch (event.type) {
       case "checkout.session.completed": {
@@ -62,6 +86,7 @@ export async function POST(req: NextRequest) {
         if (userId) {
           const status = subscription.status === "active" ? "ACTIVE" :
                          subscription.status === "past_due" ? "PAST_DUE" :
+                         subscription.status === "paused" ? "PAUSED" :
                          subscription.status === "canceled" ? "CANCELED" : "EXPIRED"
 
           const priceId = subscription.items.data[0]?.price.id
@@ -144,6 +169,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ received: true })
   } catch (error) {
     console.error("Webhook handler error:", error)
+    // The idempotency row was recorded before handling. Since handling failed,
+    // remove it so Stripe's retry can re-process this event instead of being
+    // skipped as a duplicate. Best-effort: ignore delete errors.
+    try {
+      await prisma.processedWebhookEvent.delete({ where: { id: event.id } })
+    } catch (cleanupErr) {
+      console.error("Failed to roll back idempotency record:", cleanupErr)
+    }
     return NextResponse.json({ error: "Webhook handler failed" }, { status: 500 })
   }
 }
